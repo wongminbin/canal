@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -44,20 +45,31 @@ import com.alibaba.otter.canal.protocol.position.EntryPosition;
  */
 public class DatabaseTableMeta implements TableMetaTSDB {
 
-    public static final EntryPosition INIT_POSITION = new EntryPosition("0", 0L, -2L, -1L);
-    private static Logger             logger        = LoggerFactory.getLogger(DatabaseTableMeta.class);
-    private static Pattern            pattern       = Pattern.compile("Duplicate entry '.*' for key '*'");
-    private static Pattern            h2Pattern     = Pattern.compile("Unique index or primary key violation");
+    public static final EntryPosition INIT_POSITION    = new EntryPosition("0", 0L, -2L, -1L);
+    private static Logger             logger           = LoggerFactory.getLogger(DatabaseTableMeta.class);
+    private static Pattern            pattern          = Pattern.compile("Duplicate entry '.*' for key '*'");
+    private static Pattern            h2Pattern        = Pattern.compile("Unique index or primary key violation");
+    private static ScheduledExecutorService  scheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread thread = new Thread(r, "[scheduler-table-meta-snapshot]");
+            thread.setDaemon(true);
+            return thread;
+        }
+    });
     private String                    destination;
     private MemoryTableMeta           memoryTableMeta;
-    private MysqlConnection           connection;                                                              // 查询meta信息的链接
+    private MysqlConnection           connection;                                                                 // 查询meta信息的链接
     private CanalEventFilter          filter;
     private CanalEventFilter          blackFilter;
     private EntryPosition             lastPosition;
-    private ScheduledExecutorService  scheduler;
+    private boolean                   hasNewDdl;
     private MetaHistoryDAO            metaHistoryDAO;
     private MetaSnapshotDAO           metaSnapshotDAO;
-
+    private int                       snapshotInterval = 24;
+    private int                       snapshotExpire   = 360;
+    private ScheduledFuture<?>        scheduleSnapshotFuture;
+    
     public DatabaseTableMeta(){
 
     }
@@ -66,30 +78,53 @@ public class DatabaseTableMeta implements TableMetaTSDB {
     public boolean init(final String destination) {
         this.destination = destination;
         this.memoryTableMeta = new MemoryTableMeta();
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
-
-            @Override
-            public Thread newThread(Runnable r) {
-                Thread thread = new Thread(r, "[scheduler-table-meta-snapshot]");
-                thread.setDaemon(true);
-                return thread;
-            }
-        });
 
         // 24小时生成一份snapshot
-        scheduler.scheduleWithFixedDelay(new Runnable() {
+        if (snapshotInterval > 0) {
+            scheduleSnapshotFuture = scheduler.scheduleWithFixedDelay(new Runnable() {
 
-            @Override
-            public void run() {
-                try {
-                    MDC.put("destination", destination);
-                    applySnapshotToDB(lastPosition, false);
-                } catch (Throwable e) {
-                    logger.error("scheudle applySnapshotToDB faield", e);
+                @Override
+                public void run() {
+                    boolean applyResult = false;
+                    try {
+                        MDC.put("destination", destination);
+                        applyResult = applySnapshotToDB(lastPosition, false);
+                    } catch (Throwable e) {
+                        logger.error("scheudle applySnapshotToDB faield", e);
+                    }
+
+                    try {
+                        MDC.put("destination", destination);
+                        if (applyResult) {
+                            snapshotExpire((int) TimeUnit.HOURS.toSeconds(snapshotExpire));
+                        }
+                    } catch (Throwable e) {
+                        logger.error("scheudle snapshotExpire faield", e);
+                    }
                 }
-            }
-        }, 24, 24, TimeUnit.HOURS);
+            }, snapshotInterval, snapshotInterval, TimeUnit.HOURS);
+        }
         return true;
+    }
+    
+    @Override
+    public void destory() {
+        if (memoryTableMeta != null) {
+            memoryTableMeta.destory();
+        }
+        
+        if (connection != null) {
+            try {
+                connection.disconnect();
+            } catch (IOException e) {
+                logger.error("ERROR # disconnect meta connection for address:{}", connection.getConnector()
+                    .getAddress(), e);
+            }
+        }
+        
+        if (scheduleSnapshotFuture != null) {
+            scheduleSnapshotFuture.cancel(false);
+        }
     }
 
     @Override
@@ -105,6 +140,7 @@ public class DatabaseTableMeta implements TableMetaTSDB {
         synchronized (memoryTableMeta) {
             if (memoryTableMeta.apply(position, schema, ddl, extra)) {
                 this.lastPosition = position;
+                this.hasNewDdl = true;
                 // 同步每次变更给远程做历史记录
                 return applyHistoryToDB(position, schema, ddl, extra);
             } else {
@@ -236,10 +272,11 @@ public class DatabaseTableMeta implements TableMetaTSDB {
         MemoryTableMeta tmpMemoryTableMeta = new MemoryTableMeta();
         Map<String, String> schemaDdls = null;
         synchronized (memoryTableMeta) {
-            if (!init && position == null) {
+            if (!init && !hasNewDdl) {
                 // 如果是持续构建,则识别一下是否有DDL变更过,如果没有就忽略了
                 return false;
             }
+            this.hasNewDdl = false;
             schemaDdls = memoryTableMeta.snapshot();
             for (Map.Entry<String, String> entry : schemaDdls.entrySet()) {
                 tmpMemoryTableMeta.apply(position, entry.getKey(), entry.getValue(), null);
@@ -461,6 +498,10 @@ public class DatabaseTableMeta implements TableMetaTSDB {
         return true;
     }
 
+    private int snapshotExpire(int expireTimestamp) {
+        return metaSnapshotDAO.deleteByTimestamp(destination, expireTimestamp);
+    }
+
     public void setConnection(MysqlConnection connection) {
         this.connection = connection;
     }
@@ -487,6 +528,22 @@ public class DatabaseTableMeta implements TableMetaTSDB {
 
     public void setBlackFilter(CanalEventFilter blackFilter) {
         this.blackFilter = blackFilter;
+    }
+
+    public int getSnapshotInterval() {
+        return snapshotInterval;
+    }
+
+    public void setSnapshotInterval(int snapshotInterval) {
+        this.snapshotInterval = snapshotInterval;
+    }
+
+    public int getSnapshotExpire() {
+        return snapshotExpire;
+    }
+
+    public void setSnapshotExpire(int snapshotExpire) {
+        this.snapshotExpire = snapshotExpire;
     }
 
     public MysqlConnection getConnection() {
